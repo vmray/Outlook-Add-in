@@ -99,8 +99,9 @@ Note: You will not be able to view Client Secret after sometime. Save it securel
 
 ### Phase 2 – Deploy Web App
 
-1. Click on below button to deploy:
-  [![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fvmray%2FOutlook-Add-in%2Fmain%2FWebApp%2Fazuredeploy.json)
+1. Click on below button to deploy
+
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fvmray%2FOutlook-Add-in%2Fmain%2FWebApp%2Fazuredeploy.json)
 
 2. On the next page, please provide the values accordingly.
 
@@ -323,3 +324,4 @@ After deployment, the add-in behavior depends on the deployment method selected 
 * Reporting a sample email forwards it to **RECIPIENT**
 * Task pane messages appear correctly
 * Web App `/health` endpoint returns `{"status":"OK"}`
+
