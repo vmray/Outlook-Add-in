@@ -37,7 +37,6 @@
       }
     },
 
-
     "Sku": {
       "type": "string",
       "defaultValue": "B1",
@@ -62,17 +61,26 @@
       "metadata": {
         "description": "Email address of the SOC or Incident Response mailbox where phishing emails will be reported."
       }
-    }
+    },
+	
+	"MoveReportedPhishingEmailsToFolder": {
+	  "type": "string",
+	  "defaultValue": "false",
+	  "allowedValues": ["true", "false"],
+	  "metadata": {
+		"description": "Determines if reported phishing emails should be moved to a designated folder after reporting."
+	  }
+	}
 
   },
 
   "variables": {
     "planName": "[concat(parameters('WebAppName'), '-plan')]",
-    "packageUrl": "https://github.com/vmray/Outlook-Add-in/raw/main/WebApp/source.zip"
+    "packageUrl": "https://github.com/lshaikloginsoft/OutlookAddin-v2/raw/main/source.zip"
   },
 
   "resources": [
-
+  
     {
       "type": "Microsoft.Web/serverfarms",
       "apiVersion": "2022-09-01",
@@ -136,6 +144,10 @@
             {
               "name": "RECIPIENT",
               "value": "[parameters('Recipient')]"
+            },
+            {
+              "name": "MOVE_REPORTED_PHISHING_EMAILS_TO_FOLDER",
+              "value": "[parameters('MoveReportedPhishingEmailsToFolder')]"
             }
           ]
         }

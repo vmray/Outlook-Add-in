@@ -119,19 +119,22 @@ Note: You will not be able to view Client Secret after sometime. Save it securel
 | Azure Tenant ID                                         | Enter the Azure Tenant ID of the App Registration
 | Sku                                         | Select the Azure App Service pricing tier used to host the web application.
 | Recipient                                         | Enter email address of the security or incident response mailbox.
+| Move Reported Phishing Emails to Folder | Set to **true** to move reported phishing emails to a folder after forwarding, or **false** to only forward the email |
 
 3. Once you provide the above values, please click on `Review + create` button.
-4. After deployment is successful, expand deployment details and click on your webapp. 
-5. In Overview, copy the `Default domain` value from the overview section. This is referred as `domain` in later steps.
+4. After deployment is successful, Click on `Go to Resource Group`.
+5. In `Resources` tab, Click on `App Service` name.
+ 
+6. In Overview, copy the `Default domain` value from the overview section. This is referred as `domain` in later steps.
 
 ![11](Images/11.png)
 
-6. Navigate to `Settings → Environment Variables` and click on `+ Add`
-7. Fill `name` as `APP_DOMAIN` and value as above copied `Domain` value. Click `Apply`
+7. Navigate to `Settings → Environment Variables` and click on `+ Add`
+8. Fill `name` as `APP_DOMAIN` and value as above copied `Domain` value. Click `Apply`
 
 ![12](Images/12.png)
 
-8. Click `Apply` and `Confirm` 
+9. Click `Apply` and `Confirm` 
 ---
 
 ## Phase 3 – Configure App Registration 
@@ -183,10 +186,7 @@ api://YOUR-DOMAIN/CLIENT_ID
 
    This value pre-authorizes all Microsoft Office application endpoints.
 
-15. Under **Authorized scopes**, enable checkbox:
-   ```
-   access_as_user
-   ```
+15. Under **Authorized scopes**, enable the checkbox.
 16. Click **Add application**
 ---
 
@@ -285,9 +285,19 @@ api://YOUR-DOMAIN/CLIENT_ID
 
  > Return to Integrated Apps → Select the add-in → Change user assignment.
 
-Note: Deployment may take up to 72 hours. Users may need to:
-* Restart Outlook
-* Refresh Outlook on the Web
+**Note:** Deployment may take up to **72 hours**.
+
+If the add-in does not appear after deployment, try the following:
+
+1. **Sign out and sign back in to Outlook (Recommended)**  
+   This forces Outlook to refresh cached add-in manifests and usually resolves the issue immediately.
+
+2. **Restart Outlook**  
+   Close and reopen the Outlook desktop application.
+
+3. **Refresh Outlook on the Web**  
+   Perform a hard refresh (Ctrl + F5) or reopen the browser.
+
 ----
 
 ## Phase 6 – Verification
@@ -324,4 +334,3 @@ After deployment, the add-in behavior depends on the deployment method selected 
 * Reporting a sample email forwards it to **RECIPIENT**
 * Task pane messages appear correctly
 * Web App `/health` endpoint returns `{"status":"OK"}`
-
