@@ -1,0 +1,1201 @@
+﻿<#
+.SYNOPSIS
+  End-to-end deployment of the VMRay Report Phishing Outlook Add-in.
+
+.DESCRIPTION
+  Single interactive script that handles all three deployment phases:
+
+    Phase 1: Azure AD App Registration (create new OR use existing)
+    Phase 2: Azure Web App deployment via ARM template
+    Phase 3: App Registration configuration (Application ID URI, scopes,
+             pre-authorization, SPA redirect)
+
+  All inputs are prompted interactively if not provided as parameters. A
+  Global Administrator must click the admin-consent URL once during Phase 1
+  to authorize the App Registration's permissions - that's the only manual
+  step the script cannot automate.
+
+  The individual scripts (setup.ps1 / deploy.ps1 / finalize.ps1) remain
+  available for advanced / CI scenarios.
+
+.PARAMETER DisplayName
+  Display name for a NEW App Registration. Ignored if using existing.
+
+.PARAMETER AppId
+  Application (Client) ID of an EXISTING App Registration. If provided,
+  the script uses this instead of creating a new one. Setting this
+  implies "Use existing".
+
+.PARAMETER ClientSecret
+  Existing client secret value (SecureString). Only used if AppId is
+  provided. If you pass AppId but not ClientSecret, the script will offer
+  to mint a new one on the existing App Reg.
+
+.PARAMETER WebAppName
+  Globally unique name for the new Azure Web App (1-20 chars, alphanumeric+hyphens).
+
+.PARAMETER ResourceGroup
+  Resource group to deploy into. Created if it doesn't exist.
+
+.PARAMETER Region
+  Azure region for the resource group. Default: "Central US".
+
+.PARAMETER Sku
+  App Service pricing tier. Default: "S1".
+
+.PARAMETER Recipient
+  IR mailbox email address (must end in ir-mailbox.vmray.com).
+
+.PARAMETER MoveReportedPhishingEmailsToFolder
+  "true" or "false". Default: "false".
+
+.PARAMETER TemplateUri
+  HTTPS URL of the ARM template (must be a raw / direct-content URL, e.g.
+  raw.githubusercontent.com/...). Default points to the published GitHub-hosted
+  template, so most customers don't need to pass anything.
+
+.PARAMETER TemplateFile
+  Path to a LOCAL ARM template file. If provided, takes precedence over
+  -TemplateUri. Use this for offline / dev / customization scenarios.
+
+.PARAMETER SkipSetup
+  Skip Phase 1. Requires -AppId and -ClientSecret.
+
+.PARAMETER SkipDeploy
+  Skip Phase 2. Requires -WebAppName (uses existing Web App).
+
+.PARAMETER SkipFinalize
+  Skip Phase 3.
+
+.EXAMPLE
+  # Fully interactive
+  ./Deploy-VMRayOutlookAddin.ps1
+
+.EXAMPLE
+  # Re-deploy reusing an existing App Reg
+  ./Deploy-VMRayOutlookAddin.ps1 -AppId "abc12345-..."
+#>
+
+[CmdletBinding()]
+param(
+  # Phase 1 - App Registration
+  [string]$DisplayName,
+  [string]$AppId,
+  [SecureString]$ClientSecret,
+  [ValidateRange(1, 2)][int]$SecretLifetimeYears = 2,
+
+  # Phase 2 - Deploy
+  [string]$WebAppName,
+  [string]$ResourceGroup,
+  [string]$Region = "Central US",
+  [ValidateSet("B1","B2","B3","S1","S2","S3","P1v3","P2v3")]
+  [string]$Sku = "S1",
+  [string]$Recipient,
+  [ValidateSet("true","false")]
+  [string]$MoveReportedPhishingEmailsToFolder = "false",
+
+  # ARM template source - remote URI (default) or local file (override)
+  [string]$TemplateUri  = "https://raw.githubusercontent.com/vmray/Outlook-Add-in/main/WebAppAuto/azuredeploy.json",
+  [string]$TemplateFile,
+
+  # Skip flags
+  [switch]$SkipSetup,
+  [switch]$SkipDeploy,
+  [switch]$SkipFinalize
+)
+
+$ErrorActionPreference = "Stop"
+$ProgressPreference     = "SilentlyContinue"
+
+# Microsoft Graph delegated permission GUIDs (well-known, identical across tenants)
+$MICROSOFT_GRAPH_APP_ID = "00000003-0000-0000-c000-000000000000"
+$REQUIRED_PERMISSIONS = @(
+  @{ Name = "Mail.Send";      Id = "e383f46e-2787-4529-855e-0e479a3ffac0" },
+  @{ Name = "Mail.ReadWrite"; Id = "024d486e-b451-40bb-833d-3e66d98c5c73" },
+  @{ Name = "User.Read";      Id = "e1fe6dd8-ba31-4d61-89e7-88639da4683d" },
+  @{ Name = "openid";         Id = "37f7f235-527c-4136-accd-4a02d197296e" }
+)
+
+# Microsoft's well-known Office host client ID (for pre-authorization)
+$OFFICE_CLIENT_ID = "ea5a67f6-b6f3-4338-b240-c655ddc3cc8e"
+
+# ===========================================================================
+#  Display helpers
+# ===========================================================================
+function Write-Banner {
+  param([string]$Title)
+  Write-Host ""
+  Write-Host "===========================================================================" -ForegroundColor Magenta
+  Write-Host "  $Title" -ForegroundColor Magenta
+  Write-Host "===========================================================================" -ForegroundColor Magenta
+}
+
+function Write-Phase {
+  param([string]$Number, [string]$Title)
+  Write-Host ""
+  Write-Host ">>> Phase $Number - $Title" -ForegroundColor Cyan
+  Write-Host ""
+}
+
+function Write-Step {
+  param([string]$Index, [string]$Message)
+  Write-Host ""
+  Write-Host "[$Index] $Message" -ForegroundColor Cyan
+}
+
+# ===========================================================================
+#  Interactive prompt helpers
+# ===========================================================================
+function Read-Choice {
+  param(
+    [string]$Prompt,
+    [string[]]$Options,
+    [int]$Default = 1
+  )
+  Write-Host ""
+  Write-Host $Prompt -ForegroundColor Yellow
+  for ($i = 0; $i -lt $Options.Length; $i++) {
+    $marker = if (($i + 1) -eq $Default) { " (default)" } else { "" }
+    Write-Host "  [$($i + 1)] $($Options[$i])$marker"
+  }
+  do {
+    $input = Read-Host "  Choice"
+    if ([string]::IsNullOrWhiteSpace($input)) { return $Default }
+    $num = 0
+    if ([int]::TryParse($input, [ref]$num) -and $num -ge 1 -and $num -le $Options.Length) {
+      return $num
+    }
+    Write-Host "    Invalid. Enter a number between 1 and $($Options.Length)." -ForegroundColor Red
+  } while ($true)
+}
+
+function Read-Text {
+  param(
+    [string]$Prompt,
+    [string]$Default = $null,
+    [string]$ValidationPattern = $null,
+    [string]$ValidationMessage = "Invalid input. Try again."
+  )
+  do {
+    $defaultHint = if ($Default) { " [default: $Default]" } else { "" }
+    Write-Host ""
+    $value = Read-Host "  $Prompt$defaultHint"
+    if ([string]::IsNullOrWhiteSpace($value) -and $Default) {
+      return $Default
+    }
+    if ([string]::IsNullOrWhiteSpace($value)) {
+      Write-Host "    Required. Please enter a value." -ForegroundColor Red
+      continue
+    }
+    if (-not $ValidationPattern -or $value -match $ValidationPattern) {
+      return $value
+    }
+    Write-Host "    $ValidationMessage" -ForegroundColor Red
+  } while ($true)
+}
+
+function Confirm-Action {
+  param([string]$Prompt, [bool]$Default = $true)
+  $defaultStr = if ($Default) { "Y/n" } else { "y/N" }
+  do {
+    Write-Host ""
+    $input = (Read-Host "  $Prompt [$defaultStr]").Trim().ToLower()
+    if ([string]::IsNullOrWhiteSpace($input)) { return $Default }
+    if ($input -in @("y","yes")) { return $true }
+    if ($input -in @("n","no"))  { return $false }
+    Write-Host "    Please answer y or n." -ForegroundColor Red
+  } while ($true)
+}
+
+function Wait-ForEnter {
+  param([string]$Message = "Press ENTER when ready to continue, or Ctrl+C to abort")
+  Write-Host ""
+  Write-Host "  $Message" -ForegroundColor Yellow
+  Read-Host | Out-Null
+}
+
+# ===========================================================================
+#  Auth helpers (mirrors setup.ps1 / finalize.ps1 patterns)
+# ===========================================================================
+function Connect-MgGraphSmart {
+  param([string[]]$Scopes = @("Application.ReadWrite.All", "Directory.Read.All"))
+
+  $context = Get-MgContext -ErrorAction SilentlyContinue
+  if ($context) {
+    try {
+      Get-MgApplication -Top 1 -ErrorAction Stop | Out-Null
+      Write-Host "  Already connected to Microsoft Graph. Reusing session." -ForegroundColor Green
+      return
+    } catch {
+      Write-Host "  Existing Graph session is stale. Re-authenticating..." -ForegroundColor Yellow
+      Disconnect-MgGraph -ErrorAction SilentlyContinue
+    }
+  }
+
+  $azContext = $null
+  try { $azContext = Get-AzContext -ErrorAction Stop } catch { }
+  if ($azContext) {
+    try {
+      Write-Host "  Using Az session to acquire Graph token..." -ForegroundColor Gray
+      $tokenResult = Get-AzAccessToken -ResourceUrl "https://graph.microsoft.com" -ErrorAction Stop
+      $secureToken = if ($tokenResult.Token -is [System.Security.SecureString]) {
+        $tokenResult.Token
+      } else {
+        ConvertTo-SecureString $tokenResult.Token -AsPlainText -Force
+      }
+      Connect-MgGraph -AccessToken $secureToken -NoWelcome -ErrorAction Stop | Out-Null
+      Write-Host "  Connected via Az session." -ForegroundColor Green
+      return
+    } catch {
+      Write-Host "  Az pass-through unavailable. Trying interactive browser..." -ForegroundColor Yellow
+    }
+  }
+
+  try {
+    Connect-MgGraph -Scopes $Scopes -NoWelcome -ErrorAction Stop | Out-Null
+    Write-Host "  Connected via interactive browser." -ForegroundColor Green
+    return
+  } catch {
+    Write-Host "  Interactive browser failed. Falling back to device code..." -ForegroundColor Yellow
+  }
+
+  Connect-MgGraph -Scopes $Scopes -UseDeviceCode -NoWelcome -ErrorAction Stop | Out-Null
+  Write-Host "  Connected via device code." -ForegroundColor Green
+}
+
+function Connect-AzSmart {
+  $azContext = Get-AzContext -ErrorAction SilentlyContinue
+  if ($azContext) {
+    Write-Host "  Azure session: $($azContext.Account.Id) (tenant $($azContext.Tenant.Id))" -ForegroundColor Green
+    return
+  }
+  Write-Host "  No Azure session. Starting sign-in..." -ForegroundColor Gray
+  Connect-AzAccount -ErrorAction Stop | Out-Null
+  $azContext = Get-AzContext
+  Write-Host "  Connected as $($azContext.Account.Id)." -ForegroundColor Green
+}
+
+# Web App names must be globally unique (they become <name>.azurewebsites.net).
+# Ask Azure's CheckNameAvailability API before committing to a multi-minute
+# deploy, so a taken name is caught in seconds instead of failing late with a
+# "Website with given name ... already exists (Conflict)" error.
+# Returns a PSCustomObject { Available; Message }, or $null if the check itself
+# couldn't run (transient/permissions) - in which case the caller proceeds and
+# lets the real deployment surface any conflict.
+function Test-WebAppNameAvailable {
+  param([string]$Name)
+  try {
+    $subId   = (Get-AzContext).Subscription.Id
+    $payload = @{ name = $Name; type = "Microsoft.Web/sites" } | ConvertTo-Json -Compress
+    $resp = Invoke-AzRestMethod -Method POST `
+      -Path "/subscriptions/$subId/providers/Microsoft.Web/checknameavailability?api-version=2023-01-01" `
+      -Payload $payload -ErrorAction Stop
+    $result = $resp.Content | ConvertFrom-Json
+    return [pscustomobject]@{
+      Available = [bool]$result.nameAvailable
+      Message   = $result.message
+    }
+  } catch {
+    return $null
+  }
+}
+
+function Invoke-WithGraphRetry {
+  param(
+    [Parameter(Mandatory=$true)][scriptblock]$Block,
+    [string]$Description = "Graph operation"
+  )
+  try {
+    return & $Block
+  } catch {
+    $errText = "$($_.Exception.Message) $($_.ErrorDetails.Message)"
+    if ($errText -match "Authentication needed|InvalidAuthenticationToken|401|TokenExpired") {
+      Write-Host "  Token expired during '$Description'. Refreshing..." -ForegroundColor Yellow
+      Connect-MgGraphSmart
+      return & $Block
+    }
+    throw
+  }
+}
+
+# ===========================================================================
+#  Module loaders
+# ===========================================================================
+function Ensure-Module {
+  param([string]$Name)
+  $module = Get-Module -ListAvailable -Name $Name | Select-Object -First 1
+  if (-not $module) {
+    Write-Host "  Installing $Name (current user, one-time)..." -ForegroundColor Yellow
+    Install-Module $Name -Scope CurrentUser -Force -AllowClobber
+  }
+  Import-Module $Name -ErrorAction Stop
+}
+
+# ===========================================================================
+#  Phase 1 helpers - App Registration
+# ===========================================================================
+function Find-AppRegistration {
+  param([string]$NameOrAppId)
+
+  # Try as AppId (GUID) first
+  if ($NameOrAppId -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+    $byAppId = Invoke-WithGraphRetry -Description "looking up App Reg by AppId" -Block {
+      Get-MgApplication -Filter "appId eq '$NameOrAppId'" -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    if ($byAppId) { return @($byAppId) }
+  }
+
+  # Otherwise, by display name (can return multiple)
+  $escapedName = $NameOrAppId.Replace("'", "''")
+  $byName = Invoke-WithGraphRetry -Description "looking up App Reg by name" -Block {
+    @(Get-MgApplication -Filter "displayName eq '$escapedName'" -ErrorAction SilentlyContinue)
+  }
+  return $byName
+}
+
+function Select-AppRegistration {
+  param([array]$Candidates)
+  if ($Candidates.Count -eq 1) { return $Candidates[0] }
+
+  Write-Host ""
+  Write-Host "  Found $($Candidates.Count) App Registrations with that name:" -ForegroundColor Yellow
+  for ($i = 0; $i -lt $Candidates.Count; $i++) {
+    $c = $Candidates[$i]
+    $created = if ($c.CreatedDateTime) { $c.CreatedDateTime.ToString("yyyy-MM-dd") } else { "unknown" }
+    Write-Host ("    [{0}] AppId: {1}  Created: {2}" -f ($i + 1), $c.AppId, $created)
+  }
+
+  do {
+    $input = Read-Host "  Which one do you want to use? [1-$($Candidates.Count)]"
+    $num = 0
+    if ([int]::TryParse($input, [ref]$num) -and $num -ge 1 -and $num -le $Candidates.Count) {
+      return $Candidates[$num - 1]
+    }
+    Write-Host "    Invalid. Enter a number between 1 and $($Candidates.Count)." -ForegroundColor Red
+  } while ($true)
+}
+
+function Add-MissingPermissions {
+  param($App)
+
+  $currentResourceAccess = @($App.RequiredResourceAccess)
+  $graphEntry = $currentResourceAccess | Where-Object { $_.ResourceAppId -eq $MICROSOFT_GRAPH_APP_ID } | Select-Object -First 1
+
+  $existingScopeIds = if ($graphEntry) {
+    @($graphEntry.ResourceAccess | Where-Object { $_.Type -eq "Scope" } | ForEach-Object { $_.Id })
+  } else { @() }
+
+  $missing = $REQUIRED_PERMISSIONS | Where-Object { $existingScopeIds -notcontains $_.Id }
+
+  if ($missing.Count -eq 0) {
+    Write-Host "  All 4 required permissions already present." -ForegroundColor Green
+    return
+  }
+
+  Write-Host "  Adding missing permissions:" -ForegroundColor Yellow
+  $missing | ForEach-Object { Write-Host "    + $($_.Name)" -ForegroundColor Yellow }
+
+  # Build the merged Graph entry (keep existing scopes, add missing ones)
+  $allGraphScopes = @($existingScopeIds + ($missing | ForEach-Object { $_.Id })) | Select-Object -Unique
+  $newGraphResourceAccess = @($allGraphScopes | ForEach-Object {
+    @{ Id = $_; Type = "Scope" }
+  })
+
+  # Preserve non-Scope (e.g., Role) entries on Graph
+  if ($graphEntry) {
+    $nonScope = @($graphEntry.ResourceAccess | Where-Object { $_.Type -ne "Scope" })
+    $newGraphResourceAccess = $newGraphResourceAccess + ($nonScope | ForEach-Object { @{ Id = $_.Id; Type = $_.Type } })
+  }
+
+  # Preserve non-Graph resource entries
+  $nonGraphEntries = @($currentResourceAccess | Where-Object { $_.ResourceAppId -ne $MICROSOFT_GRAPH_APP_ID } |
+    ForEach-Object {
+      @{
+        ResourceAppId  = $_.ResourceAppId
+        ResourceAccess = @($_.ResourceAccess | ForEach-Object { @{ Id = $_.Id; Type = $_.Type } })
+      }
+    })
+
+  $newRequiredResourceAccess = @(
+    @{
+      ResourceAppId  = $MICROSOFT_GRAPH_APP_ID
+      ResourceAccess = $newGraphResourceAccess
+    }
+  ) + $nonGraphEntries
+
+  Invoke-WithGraphRetry -Description "adding missing permissions" -Block {
+    Update-MgApplication -ApplicationId $App.Id -RequiredResourceAccess $newRequiredResourceAccess
+  }
+}
+
+function Test-AdminConsentGranted {
+  param([string]$AppIdToCheck)
+
+  try {
+    $sp = Invoke-WithGraphRetry -Description "looking up service principal" -Block {
+      Get-MgServicePrincipal -Filter "appId eq '$AppIdToCheck'" -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    if (-not $sp) { return $false }   # No SP yet = no consent
+
+    $grants = Invoke-WithGraphRetry -Description "listing OAuth2 grants" -Block {
+      Get-MgOauth2PermissionGrant -Filter "clientId eq '$($sp.Id)'" -ErrorAction SilentlyContinue
+    }
+    if (-not $grants) { return $false }
+
+    # Look for a grant for Microsoft Graph that includes all our required scopes
+    $graphSp = Invoke-WithGraphRetry -Description "looking up Graph SP" -Block {
+      Get-MgServicePrincipal -Filter "appId eq '$MICROSOFT_GRAPH_APP_ID'" -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    if (-not $graphSp) { return $false }
+
+    $grantsForGraph = @($grants | Where-Object { $_.ResourceId -eq $graphSp.Id })
+    if ($grantsForGraph.Count -eq 0) { return $false }
+
+    $grantedScopes = @()
+    foreach ($g in $grantsForGraph) {
+      if ($g.Scope) { $grantedScopes += ($g.Scope -split ' ') }
+    }
+    $grantedScopes = $grantedScopes | Where-Object { $_ } | Select-Object -Unique
+
+    $requiredScopeNames = $REQUIRED_PERMISSIONS | ForEach-Object { $_.Name }
+    foreach ($req in $requiredScopeNames) {
+      if ($grantedScopes -notcontains $req) { return $false }
+    }
+    return $true
+  } catch {
+    # Surface the real error (rare) instead of silently swallowing it, so a
+    # genuine permission/API failure doesn't masquerade as "consent not granted".
+    Write-Host "    (consent check couldn't complete: $($_.Exception.Message))" -ForegroundColor DarkGray
+    return $false
+  }
+}
+
+# Retry the consent verification up to N times with delay between attempts.
+# Returns $true once consent is detected on all 4 scopes; $false after timeout.
+# Used to absorb the 10-90s propagation lag between Microsoft's consent DB
+# and Graph API's read-side.
+function Wait-ForConsentToPropagate {
+  param(
+    [Parameter(Mandatory=$true)][string]$AppIdToCheck,
+    [int]$MaxRetries = 6,
+    [int]$RetryDelay = 15
+  )
+
+  Write-Host "  Verifying consent..." -ForegroundColor Gray
+
+  # Check immediately first - if consent has already propagated, detect it
+  # instantly instead of always burning the initial 15s.
+  if (Test-AdminConsentGranted -AppIdToCheck $AppIdToCheck) {
+    Write-Host "  Consent confirmed for all 4 permissions." -ForegroundColor Green
+    return $true
+  }
+
+  for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+    Start-Sleep -Seconds $RetryDelay
+
+    if (Test-AdminConsentGranted -AppIdToCheck $AppIdToCheck) {
+      Write-Host "  Consent confirmed for all 4 permissions." -ForegroundColor Green
+      return $true
+    }
+
+    if ($attempt -lt $MaxRetries) {
+      $elapsed = $attempt * $RetryDelay
+      Write-Host "  Still propagating (${elapsed}s elapsed), retrying..." -ForegroundColor Gray
+    }
+  }
+
+  return $false
+}
+
+# ===========================================================================
+#                              SCRIPT START
+# ===========================================================================
+
+Write-Banner "VMRay Outlook Add-in - End-to-End Deployment"
+
+Write-Host ""
+Write-Host "  This script will:" -ForegroundColor Gray
+Write-Host "    1. Create or reuse an Azure AD App Registration" -ForegroundColor Gray
+Write-Host "    2. Deploy the Azure Web App via ARM template" -ForegroundColor Gray
+Write-Host "    3. Configure the App Registration with the new Web App's domain" -ForegroundColor Gray
+Write-Host ""
+Write-Host "  Phase 1 includes one manual checkpoint (Global Admin clicks consent URL)." -ForegroundColor Gray
+
+# ---------------------------------------------------------------------------
+# Pre-flight: connect + show context
+# ---------------------------------------------------------------------------
+Write-Phase "0" "Pre-flight"
+
+Write-Step "1/2" "Loading PowerShell modules..."
+Ensure-Module Microsoft.Graph.Applications
+Ensure-Module Az.Resources
+
+Write-Step "2/2" "Connecting to Microsoft Graph and Azure..."
+Connect-MgGraphSmart
+Connect-AzSmart
+
+$mgContext = Get-MgContext
+$azContext = Get-AzContext
+$tenantId  = $mgContext.TenantId
+
+Write-Host ""
+Write-Host "  Tenant       : $tenantId" -ForegroundColor White
+Write-Host "  Subscription : $($azContext.Subscription.Name) ($($azContext.Subscription.Id))" -ForegroundColor White
+Write-Host ""
+
+# Look up all subscriptions visible in this tenant so we can offer a picker
+# when the account has access to more than one. Silent fallback to the
+# current sub if the lookup fails (e.g. permissions issue).
+$allSubs = @()
+try {
+  $allSubs = @(Get-AzSubscription -TenantId $tenantId -ErrorAction Stop | Sort-Object Name)
+} catch {
+  $allSubs = @($azContext.Subscription)
+}
+
+if ($allSubs.Count -le 1) {
+  if (-not (Confirm-Action "Continue with this tenant + subscription?")) {
+    throw "Aborted by user. Switch context (Connect-AzAccount / Connect-MgGraph) and retry."
+  }
+} else {
+  Write-Host "  $($allSubs.Count) subscriptions are accessible in this tenant." -ForegroundColor Gray
+  $subChoice = Read-Choice -Prompt "How do you want to handle the subscription?" -Options @(
+    "Use the current subscription shown above",
+    "Switch to a different subscription"
+  ) -Default 1
+
+  if ($subChoice -eq 2) {
+    $subOptions = @($allSubs | ForEach-Object { "$($_.Name) ($($_.Id))" })
+    $picked = Read-Choice -Prompt "Pick a subscription:" -Options $subOptions -Default 1
+    $chosenSub = $allSubs[$picked - 1]
+    Set-AzContext -SubscriptionId $chosenSub.Id -TenantId $tenantId | Out-Null
+    $azContext = Get-AzContext
+    Write-Host ""
+    Write-Host "  Now using: $($azContext.Subscription.Name) ($($azContext.Subscription.Id))" -ForegroundColor Green
+  }
+}
+
+# ===========================================================================
+# PHASE 1 - App Registration
+# ===========================================================================
+$skipPhase1              = $SkipSetup.IsPresent
+$consentDeferredToAdmin  = $false
+$deferredConsentUrl      = $null
+
+if ($skipPhase1) {
+  Write-Phase "1" "App Registration - SKIPPED (--SkipSetup)"
+  if (-not $AppId)        { throw "-SkipSetup requires -AppId" }
+  if (-not $ClientSecret) { throw "-SkipSetup requires -ClientSecret" }
+  $app = Invoke-WithGraphRetry -Description "loading App Reg" -Block {
+    Get-MgApplication -Filter "appId eq '$AppId'" -ErrorAction SilentlyContinue | Select-Object -First 1
+  }
+  if (-not $app) { throw "App Registration with AppId '$AppId' not found." }
+  $appClientId       = $app.AppId
+  $appClientSecret   = $ClientSecret
+}
+else {
+  Write-Phase "1" "App Registration"
+
+  # Determine NEW vs EXISTING
+  $appChoice = if ($AppId) { 2 }
+               else { Read-Choice -Prompt "How do you want to handle the App Registration?" `
+                                  -Options @("Create a new App Registration",
+                                             "Use an existing App Registration") `
+                                  -Default 1 }
+
+  if ($appChoice -eq 1) {
+    # ----- NEW App Reg path -----
+    # Loop until we have a name the user is happy to create. If duplicates exist
+    # and the user declines to reuse the name, re-prompt for a different one
+    # instead of exiting the whole script.
+    while ($true) {
+      if (-not $DisplayName) {
+        $DisplayName = Read-Text -Prompt "Display name for the new App Registration" `
+                                  -Default "VMRay-Outlook-Addin-App"
+      }
+
+      # Warn on duplicates
+      $existing = Invoke-WithGraphRetry -Description "checking for duplicates" -Block {
+        $escName = $DisplayName.Replace("'", "''")
+        @(Get-MgApplication -Filter "displayName eq '$escName'")
+      }
+      if ($existing.Count -eq 0) { break }
+
+      Write-Host ""
+      Write-Host "  WARNING: $($existing.Count) App Registration(s) named '$DisplayName' already exist:" -ForegroundColor Yellow
+      $existing | ForEach-Object { Write-Host "    - AppId: $($_.AppId)" -ForegroundColor Yellow }
+      if (Confirm-Action "Create another with the same name?" -Default $false) { break }
+
+      # User declined - clear the name so the loop re-prompts for a different one.
+      Write-Host "  Please enter a different name for the new App Registration." -ForegroundColor Yellow
+      $DisplayName = $null
+    }
+
+    Write-Step "1/3" "Creating App Registration '$DisplayName'..."
+    # https://portal.azure.com/ as the placeholder Web redirect URI lands the
+    # Global Admin on the Azure portal home page after consent - friendlier than
+    # the older 'nativeclient' URL which produced a "Not the right page" message.
+    $app = Invoke-WithGraphRetry -Description "creating App Reg" -Block {
+      New-MgApplication `
+        -DisplayName $DisplayName `
+        -SignInAudience "AzureADMyOrg" `
+        -Web @{ RedirectUris = @('https://portal.azure.com/') }
+    }
+    Write-Host "  Created (AppId: $($app.AppId))" -ForegroundColor Green
+
+    Write-Step "2/3" "Adding required Microsoft Graph permissions..."
+    $resourceAccess = @($REQUIRED_PERMISSIONS | ForEach-Object { @{ Id = $_.Id; Type = "Scope" } })
+    Invoke-WithGraphRetry -Description "setting permissions" -Block {
+      Update-MgApplication -ApplicationId $app.Id -RequiredResourceAccess @(
+        @{ ResourceAppId = $MICROSOFT_GRAPH_APP_ID; ResourceAccess = $resourceAccess }
+      )
+    }
+    $REQUIRED_PERMISSIONS | ForEach-Object { Write-Host "    + $($_.Name)" -ForegroundColor Green }
+
+    Write-Step "3/3" "Creating client secret (valid for $SecretLifetimeYears year(s))..."
+    $secretParams = @{
+      PasswordCredential = @{
+        DisplayName = "VMRay add-in secret (created $(Get-Date -Format 'yyyy-MM-dd'))"
+        EndDateTime = (Get-Date).AddYears($SecretLifetimeYears)
+      }
+    }
+    $secret = Invoke-WithGraphRetry -Description "creating secret" -Block {
+      Add-MgApplicationPassword -ApplicationId $app.Id -BodyParameter $secretParams
+    }
+    Write-Host "  Secret created (expires: $($secret.EndDateTime.ToString('yyyy-MM-dd')))" -ForegroundColor Green
+    $appClientSecret = ConvertTo-SecureString $secret.SecretText -AsPlainText -Force
+
+    # ----- Save secret for customer record -----
+    Write-Host ""
+    Write-Host "  +----------------------------------------------------------------------+" -ForegroundColor Yellow
+    Write-Host "  |  CLIENT SECRET (visible only once - save it now if you need it):     |" -ForegroundColor Yellow
+    Write-Host "  |                                                                      |" -ForegroundColor Yellow
+    Write-Host "  |  $($secret.SecretText)" -ForegroundColor White
+    Write-Host "  |                                                                      |" -ForegroundColor Yellow
+    Write-Host "  +----------------------------------------------------------------------+" -ForegroundColor Yellow
+  }
+  else {
+    # ----- EXISTING App Reg path -----
+    # Loop until we locate a matching App Registration. A mistyped name/AppId
+    # re-prompts instead of exiting the whole script.
+    $app = $null
+    while ($true) {
+      if (-not $AppId) {
+        $nameOrId = Read-Text -Prompt "Enter App Registration name OR Application (Client) ID"
+      } else {
+        $nameOrId = $AppId
+      }
+
+      $candidates = Find-AppRegistration -NameOrAppId $nameOrId
+      if ($candidates.Count -gt 0) {
+        $app = Select-AppRegistration -Candidates $candidates
+        break
+      }
+
+      Write-Host "    No App Registration found matching '$nameOrId'. Check the name/AppId and try again." -ForegroundColor Red
+      # Clear the parameter value so the loop prompts interactively next time.
+      $AppId = $null
+    }
+
+    Write-Host ""
+    Write-Host "  Selected: $($app.DisplayName)  (AppId: $($app.AppId))" -ForegroundColor Green
+
+    Write-Step "1/2" "Verifying and adding missing permissions..."
+    Add-MissingPermissions -App $app
+
+    Write-Step "2/2" "Resolving client secret..."
+    if ($ClientSecret) {
+      Write-Host "  Using ClientSecret provided via parameter." -ForegroundColor Green
+      $appClientSecret = $ClientSecret
+    } else {
+      $secretChoice = Read-Choice -Prompt "Do you have the client secret for this App Registration?" `
+                                  -Options @("Yes - I'll paste it now",
+                                             "No - generate a new client secret on this App Reg") `
+                                  -Default 2
+      if ($secretChoice -eq 1) {
+        Write-Host ""
+        Write-Host "  Paste the client secret value (input hidden):" -ForegroundColor Yellow
+        do {
+          $appClientSecret = Read-Host -AsSecureString "  Client Secret"
+          if ($appClientSecret.Length -eq 0) {
+            Write-Host "  Client secret cannot be empty. Please paste a value." -ForegroundColor Red
+          }
+        } while ($appClientSecret.Length -eq 0)
+      } else {
+        Write-Host "  Creating a fresh client secret (existing secrets stay valid)..." -ForegroundColor Yellow
+        $secretParams = @{
+          PasswordCredential = @{
+            DisplayName = "VMRay add-in secret (created $(Get-Date -Format 'yyyy-MM-dd'))"
+            EndDateTime = (Get-Date).AddYears($SecretLifetimeYears)
+          }
+        }
+        $secret = Invoke-WithGraphRetry -Description "minting new secret" -Block {
+          Add-MgApplicationPassword -ApplicationId $app.Id -BodyParameter $secretParams
+        }
+        Write-Host "  Secret created (expires: $($secret.EndDateTime.ToString('yyyy-MM-dd')))" -ForegroundColor Green
+        $appClientSecret = ConvertTo-SecureString $secret.SecretText -AsPlainText -Force
+        Write-Host ""
+        Write-Host "  +----------------------------------------------------------------------+" -ForegroundColor Yellow
+        Write-Host "  |  NEW CLIENT SECRET (visible only once):                              |" -ForegroundColor Yellow
+        Write-Host "  |                                                                      |" -ForegroundColor Yellow
+        Write-Host "  |  $($secret.SecretText)" -ForegroundColor White
+        Write-Host "  |                                                                      |" -ForegroundColor Yellow
+        Write-Host "  +----------------------------------------------------------------------+" -ForegroundColor Yellow
+      }
+    }
+  }
+
+  $appClientId = $app.AppId
+
+  # ----- Admin consent -----
+  Write-Step "Consent" "Verifying admin consent status..."
+  $consentAlreadyGranted = Test-AdminConsentGranted -AppIdToCheck $appClientId
+
+  if ($consentAlreadyGranted) {
+    Write-Host "  Admin consent already granted for all 4 permissions. Skipping." -ForegroundColor Green
+  } else {
+    $consentUrl = "https://login.microsoftonline.com/$tenantId/adminconsent?client_id=$appClientId"
+    Write-Host ""
+    Write-Host "  Admin consent is REQUIRED before the add-in will work for users." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  Open this URL in a browser:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "    $consentUrl" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Sign in as a user authorized to grant tenant-wide admin consent," -ForegroundColor Yellow
+    Write-Host "  and click 'Accept'." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  After Accept, the browser redirects to the Azure portal home page" -ForegroundColor Gray
+    Write-Host "  (that's the confirmation that consent was granted)." -ForegroundColor Gray
+    try { Start-Process $consentUrl -ErrorAction Stop | Out-Null } catch { }
+
+    Write-Host ""
+    $consentChoice = Read-Choice -Prompt "Consent step:" -Options @(
+      "Access granted - continue (verifies and waits up to 90s)",
+      "Skip - to be done manually later by an authorized admin"
+    ) -Default 1
+
+    if ($consentChoice -eq 2) {
+      Write-Host ""
+      Write-Host "  Skipping consent verification. Forward the URL above to an authorized admin." -ForegroundColor Yellow
+      Write-Host "  Phases 2 and 3 will still run; the add-in will not work for end-users" -ForegroundColor Yellow
+      Write-Host "  until consent is granted." -ForegroundColor Yellow
+      $consentDeferredToAdmin = $true
+      $deferredConsentUrl     = $consentUrl
+    } else {
+      # Verify with retries - usually 10-30s, can take up to ~90s.
+      Write-Host ""
+      $consentVerified = Wait-ForConsentToPropagate -AppIdToCheck $appClientId
+
+      # If verification failed after 90s, offer the user a recovery loop:
+      # most "first click didn't register" cases are fixed by clicking the
+      # consent URL again. Loop until verified, continue-anyway, or abort.
+      $continueWithoutConsent = $false
+      while (-not $consentVerified -and -not $continueWithoutConsent) {
+        Write-Host ""
+        Write-Host "  WARNING: Consent verification didn't see all permissions granted after 90 seconds." -ForegroundColor Yellow
+        Write-Host "  Either propagation is unusually slow, OR the Accept click didn't actually register." -ForegroundColor Yellow
+        Write-Host "  Verify in Portal: Entra ID -> App Reg -> API permissions -> Status column." -ForegroundColor Gray
+
+        $recoveryChoice = Read-Choice -Prompt "What would you like to do?" -Options @(
+          "Wait another 90s and re-check (consent often just needs more time to propagate)",
+          "Re-open the consent URL and try again (if the Accept click may not have registered)",
+          "I've confirmed consent IS granted in the Portal - continue as granted",
+          "Continue with deployment anyway (add-in won't work until consent is fixed later)",
+          "Abort"
+        ) -Default 1
+
+        switch ($recoveryChoice) {
+          1 {
+            # Pure propagation lag: re-poll without forcing a re-click of Accept.
+            Write-Host ""
+            $consentVerified = Wait-ForConsentToPropagate -AppIdToCheck $appClientId
+          }
+          2 {
+            Write-Host ""
+            Write-Host "  Re-opening consent URL:" -ForegroundColor Cyan
+            Write-Host "    $consentUrl" -ForegroundColor Gray
+            Write-Host "  Tip: try an InPrivate / Incognito window, or sign out of other Microsoft accounts first." -ForegroundColor Gray
+            try { Start-Process $consentUrl -ErrorAction Stop | Out-Null } catch { }
+            Wait-ForEnter "After clicking Accept again, press ENTER"
+            $consentVerified = Wait-ForConsentToPropagate -AppIdToCheck $appClientId
+          }
+          3 {
+            # Manual override: the user can see the green tick in the Portal even
+            # though Graph's read-side hasn't caught up. Trust it and proceed as
+            # granted (NOT deferred), so the final summary won't flag consent.
+            Write-Host "  Trusting Portal confirmation - continuing as granted." -ForegroundColor Green
+            $consentVerified = $true
+          }
+          4 {
+            Write-Host "  Continuing without verified consent. Add-in won't work until consent is granted manually." -ForegroundColor Yellow
+            $continueWithoutConsent  = $true
+            $consentDeferredToAdmin  = $true
+            $deferredConsentUrl      = $consentUrl
+          }
+          5 {
+            throw "Aborted by user. Re-run after consent propagates."
+          }
+        }
+      }
+    }
+  }
+}
+
+# ===========================================================================
+# PHASE 2 - ARM Deploy
+# ===========================================================================
+if ($SkipDeploy.IsPresent) {
+  Write-Phase "2" "ARM Deploy - SKIPPED (--SkipDeploy)"
+  if (-not $WebAppName)    { $WebAppName    = Read-Text -Prompt "Existing Web App name (without .azurewebsites.net)" `
+                                                        -ValidationPattern '^[a-zA-Z0-9-]{1,40}$' }
+  $domain = "$WebAppName.azurewebsites.net"
+  Write-Host "  Using existing Web App at: $domain" -ForegroundColor Yellow
+}
+else {
+  Write-Phase "2" "Deploy Azure Web App"
+
+  # Loop until we have a globally-available Web App name. The name becomes a
+  # public hostname, so a taken name is rejected up front (in seconds) rather
+  # than after several minutes of deployment.
+  while ($true) {
+    if (-not $WebAppName) {
+      $WebAppName = Read-Text -Prompt "Web App name (1-20 chars, alphanumeric+hyphens)" `
+                              -ValidationPattern '^[a-zA-Z0-9-]{1,20}$' `
+                              -ValidationMessage "Must be 1-20 chars, letters/numbers/hyphens only."
+    }
+
+    $availability = Test-WebAppNameAvailable -Name $WebAppName
+    if (-not $availability) {
+      Write-Host "  Could not verify name availability - continuing (the deployment will catch any conflict)." -ForegroundColor Yellow
+      break
+    }
+    if ($availability.Available) {
+      Write-Host "  Web App name '$WebAppName' is available." -ForegroundColor Green
+      break
+    }
+
+    Write-Host ""
+    Write-Host "  Web App name '$WebAppName' is not available:" -ForegroundColor Red
+    if ($availability.Message) { Write-Host "    $($availability.Message)" -ForegroundColor Red }
+    Write-Host "  Web App names must be unique across all of Azure. Please choose another." -ForegroundColor Yellow
+    # Clear so the loop re-prompts (also drops a name supplied via -WebAppName).
+    $WebAppName = $null
+  }
+
+  if (-not $ResourceGroup) {
+    $ResourceGroup = Read-Text -Prompt "Resource group name (will be created if it doesn't exist)"
+  }
+
+  # If the RG already exists, reuse its location so the Web App lands in the
+  # same region as the rest of the customer's infrastructure. Only prompt for
+  # a region when the RG is new (or when -Region was passed explicitly).
+  if (-not $PSBoundParameters.ContainsKey('Region')) {
+    $existingRg = Get-AzResourceGroup -Name $ResourceGroup -ErrorAction SilentlyContinue
+    if ($existingRg) {
+      $Region = $existingRg.Location
+      Write-Host ""
+      Write-Host "  Using existing RG location: $Region" -ForegroundColor Green
+    } else {
+      $Region = Read-Text -Prompt "Azure region" -Default $Region
+    }
+  }
+
+  if (-not $PSBoundParameters.ContainsKey('Sku')) {
+    # Numbered picker built from the same fixed SKU list as the -Sku parameter's
+    # ValidateSet, so an invalid value can't be typed. Default to whatever $Sku
+    # currently holds (S1 unless overridden).
+    $skuOptions = @("B1","B2","B3","S1","S2","S3","P1v3","P2v3")
+    $skuDefault = [array]::IndexOf($skuOptions, $Sku) + 1
+    if ($skuDefault -lt 1) { $skuDefault = 4 }   # fall back to S1
+    $skuPick = Read-Choice -Prompt "App Service SKU:" -Options $skuOptions -Default $skuDefault
+    $Sku = $skuOptions[$skuPick - 1]
+  }
+
+  if (-not $Recipient) {
+    $Recipient = Read-Text -Prompt "IR mailbox email address" `
+                           -ValidationPattern '^[^\s@]+@[^\s@]+\.[^\s@]+$' `
+                           -ValidationMessage "Must be a valid email address."
+  }
+
+  if (-not $PSBoundParameters.ContainsKey('MoveReportedPhishingEmailsToFolder')) {
+    $moveChoice = Read-Choice -Prompt "Move reported phishing emails to a 'Phishing Report' folder?" `
+                              -Options @("No (just forward, keep in inbox)",
+                                         "Yes (forward AND move to a folder)") `
+                              -Default 1
+    $MoveReportedPhishingEmailsToFolder = if ($moveChoice -eq 2) { "true" } else { "false" }
+  }
+
+  # Confirm before destructive action
+  Write-Host ""
+  Write-Host "  About to deploy with:" -ForegroundColor Yellow
+  Write-Host "    Web App Name : $WebAppName" -ForegroundColor White
+  Write-Host "    Resource Grp : $ResourceGroup" -ForegroundColor White
+  Write-Host "    Region       : $Region" -ForegroundColor White
+  Write-Host "    SKU          : $Sku" -ForegroundColor White
+  Write-Host "    Recipient    : $Recipient" -ForegroundColor White
+  Write-Host "    Move to fldr : $MoveReportedPhishingEmailsToFolder" -ForegroundColor White
+  if (-not (Confirm-Action "Proceed with deployment?")) {
+    throw "Aborted by user."
+  }
+
+  # Resource group
+  Write-Step "1/3" "Ensuring resource group exists..."
+  $rg = Get-AzResourceGroup -Name $ResourceGroup -ErrorAction SilentlyContinue
+  if ($rg) {
+    Write-Host "  Exists in region '$($rg.Location)'." -ForegroundColor Green
+  } else {
+    Write-Host "  Creating resource group in '$Region'..." -ForegroundColor Yellow
+    New-AzResourceGroup -Name $ResourceGroup -Location $Region | Out-Null
+    Write-Host "  Created." -ForegroundColor Green
+  }
+
+  # Validate template
+  Write-Step "2/3" "Validating ARM template..."
+  if ($TemplateFile -and -not (Test-Path $TemplateFile)) {
+    throw "ARM template not found at: $TemplateFile"
+  }
+
+  # Use splatting (named dynamic parameters) instead of -TemplateParameterObject.
+  # The Object form serializes the hashtable to JSON, which breaks on SecureString.
+  # Splatting binds via the cmdlet's dynamic parameters and handles SecureString correctly.
+  $testParams = @{
+    ResourceGroupName                   = $ResourceGroup
+    WebAppName                          = $WebAppName
+    AzureClientID                       = $appClientId
+    AzureClientSecret                   = $appClientSecret
+    AzureTenantID                       = $tenantId
+    Sku                                 = $Sku
+    Recipient                           = $Recipient
+    MoveReportedPhishingEmailsToFolder  = $MoveReportedPhishingEmailsToFolder
+    ErrorAction                         = "Stop"
+  }
+  if ($TemplateFile) { $testParams.TemplateFile = $TemplateFile }
+  else               { $testParams.TemplateUri  = $TemplateUri  }
+  try {
+    $validationResult = Test-AzResourceGroupDeployment @testParams
+    if ($validationResult) {
+      Write-Host "  Validation FAILED:" -ForegroundColor Red
+      $validationResult | ForEach-Object { Write-Host "    - $($_.Message)" -ForegroundColor Red }
+      throw "Template validation failed."
+    }
+    Write-Host "  Validation passed." -ForegroundColor Green
+  } catch {
+    if ($_.Exception.Message -match "serialize secure string|SecureString") {
+      Write-Host "  Pre-validation skipped (Az SecureString serialization quirk - harmless)." -ForegroundColor Yellow
+      Write-Host "  The actual deployment in the next step will surface any template errors." -ForegroundColor Gray
+    } else {
+      throw
+    }
+  }
+
+  # Remove any stale 'waitForWebApp' deployment script from a previous run.
+  # A Microsoft.Resources/deploymentScripts resource keeps a fixed name and
+  # lingers in the RG (with async-deleted backing ACI + storage). Re-deploying
+  # into the same RG collides with those leftovers and fails the deployment.
+  # Deleting the resource first forces a full teardown so the redeploy is clean.
+  $staleScript = Get-AzResource -ResourceGroupName $ResourceGroup `
+    -ResourceType "Microsoft.Resources/deploymentScripts" `
+    -Name "waitForWebApp" -ErrorAction SilentlyContinue
+  if ($staleScript) {
+    Write-Host "  Removing stale 'waitForWebApp' deployment script from a previous run..." -ForegroundColor Yellow
+    Remove-AzResource -ResourceId $staleScript.ResourceId -Force -ErrorAction SilentlyContinue | Out-Null
+    Write-Host "  Removed." -ForegroundColor Green
+  }
+
+  # Deploy
+  Write-Step "3/3" "Deploying (this may take up to 10 minutes)..."
+  $deploymentName = "vmray-outlook-$(Get-Date -Format 'yyyyMMddHHmmss')"
+  Write-Host "  Deployment name: $deploymentName" -ForegroundColor Gray
+
+  $deployParams = @{
+    Name                                = $deploymentName
+    ResourceGroupName                   = $ResourceGroup
+    WebAppName                          = $WebAppName
+    AzureClientID                       = $appClientId
+    AzureClientSecret                   = $appClientSecret
+    AzureTenantID                       = $tenantId
+    Sku                                 = $Sku
+    Recipient                           = $Recipient
+    MoveReportedPhishingEmailsToFolder  = $MoveReportedPhishingEmailsToFolder
+    ErrorAction                         = "Stop"
+  }
+  if ($TemplateFile) { $deployParams.TemplateFile = $TemplateFile }
+  else               { $deployParams.TemplateUri  = $TemplateUri  }
+  $deployment = New-AzResourceGroupDeployment @deployParams
+  if ($deployment.ProvisioningState -ne "Succeeded") {
+    throw "Deployment finished with state '$($deployment.ProvisioningState)'."
+  }
+  Write-Host "  Deployment succeeded." -ForegroundColor Green
+
+  # Use the actual hostname Azure assigned (handles unique-hostname feature, sovereign clouds)
+  $domain = if ($deployment.Outputs.WebAppURL) {
+    ($deployment.Outputs.WebAppURL.Value -replace '^https?://', '').TrimEnd('/')
+  } else {
+    "$WebAppName.azurewebsites.net"
+  }
+  Write-Host "  Web App URL: https://$domain" -ForegroundColor Green
+}
+
+# ===========================================================================
+# PHASE 3 - Finalize App Registration
+# ===========================================================================
+if ($SkipFinalize.IsPresent) {
+  Write-Phase "3" "Configure App Registration - SKIPPED (--SkipFinalize)"
+}
+else {
+  Write-Phase "3" "Configure App Registration for domain '$domain'"
+
+  # Reload app fresh (state may have changed since Phase 1).
+  # Do NOT use -ErrorAction SilentlyContinue here: Phase 2 can take several
+  # minutes, during which the Graph token may expire. SilentlyContinue would
+  # swallow that auth error and return $null, which later surfaces as the cryptic
+  # "Cannot bind argument to parameter 'ApplicationId' ... empty string" at the
+  # Update-MgApplication call below. Instead let Invoke-WithGraphRetry catch the
+  # auth error and reconnect, retry a few times to absorb Graph replication lag,
+  # and fail with an actionable message if the App Reg still can't be read.
+  $app = $null
+  for ($reloadAttempt = 1; $reloadAttempt -le 5; $reloadAttempt++) {
+    try {
+      $app = Invoke-WithGraphRetry -Description "reloading App Reg" -Block {
+        Get-MgApplication -Filter "appId eq '$appClientId'" -ErrorAction Stop | Select-Object -First 1
+      }
+    } catch {
+      Write-Host "  Reload attempt $reloadAttempt failed: $($_.Exception.Message)" -ForegroundColor Gray
+    }
+    if ($app -and $app.Id) { break }
+    if ($reloadAttempt -lt 5) {
+      Write-Host "  App Registration not readable yet (token or replication lag). Retrying in 5s..." -ForegroundColor Gray
+      Start-Sleep -Seconds 5
+    }
+  }
+  if (-not $app -or -not $app.Id) {
+    throw @"
+Could not reload App Registration '$appClientId' from Microsoft Graph after 5 attempts.
+Your Graph session likely expired during Phase 2 (which can take several minutes).
+Reconnect and re-run Phase 3 only:
+  Connect-MgGraph -Scopes Application.ReadWrite.All
+  ./Deploy-VMRayOutlookAddin.ps1 -SkipSetup -SkipDeploy -AppId '$appClientId' -ClientSecret <secret> -WebAppName '$WebAppName'
+"@
+  }
+
+  # Compute identifier URI
+  $identifierUri = "api://$domain/$appClientId"
+  Write-Host "  Identifier URI: $identifierUri" -ForegroundColor Gray
+
+  # Compute scope (reuse existing access_as_user Id if present)
+  $existingScope = $app.Api.Oauth2PermissionScopes | Where-Object { $_.Value -eq "access_as_user" } | Select-Object -First 1
+  $scopeId = if ($existingScope) {
+    Write-Host "  Reusing existing 'access_as_user' scope (Id: $($existingScope.Id))" -ForegroundColor Yellow
+    $existingScope.Id
+  } else {
+    Write-Host "  Creating 'access_as_user' scope" -ForegroundColor Gray
+    [guid]::NewGuid().ToString()
+  }
+
+  $accessAsUserScope = @{
+    Id                      = $scopeId
+    Value                   = "access_as_user"
+    Type                    = "Admin"
+    IsEnabled               = $true
+    AdminConsentDisplayName = "Access VMRay Outlook Add-in API"
+    AdminConsentDescription = "Allows the Outlook Add-in to access the middle-tier API on behalf of the signed-in user."
+  }
+  $otherScopes = @($app.Api.Oauth2PermissionScopes | Where-Object { $_.Value -ne "access_as_user" })
+  $allScopes   = @($accessAsUserScope) + $otherScopes
+
+  # Office pre-auth
+  $officePreAuth = @{ AppId = $OFFICE_CLIENT_ID; DelegatedPermissionIds = @($scopeId) }
+  $otherPreAuth  = @($app.Api.PreAuthorizedApplications | Where-Object { $_.AppId -ne $OFFICE_CLIENT_ID })
+  $allPreAuth    = @($officePreAuth) + $otherPreAuth
+
+  # SPA URI
+  $spaUri = "https://$domain/fallbackauthdialog.html"
+  $existingSpaUris = @($app.Spa.RedirectUris)
+  $allSpaUris = if ($existingSpaUris -contains $spaUri) { $existingSpaUris } else { $existingSpaUris + $spaUri }
+
+  # Two-pass PATCH (Graph validates pre-auth against pre-PATCH scope list)
+  $preAuthWithoutOffice = @($app.Api.PreAuthorizedApplications | Where-Object { $_.AppId -ne $OFFICE_CLIENT_ID })
+
+  Invoke-WithGraphRetry -Description "Phase 3 pass 1" -Block {
+    Update-MgApplication -ApplicationId $app.Id `
+      -IdentifierUris @($identifierUri) `
+      -Api @{ Oauth2PermissionScopes = $allScopes; PreAuthorizedApplications = $preAuthWithoutOffice } `
+      -Spa @{ RedirectUris = $allSpaUris } `
+      -ErrorAction Stop
+  } | Out-Null
+
+  Write-Host "  + Application ID URI"   -ForegroundColor Green
+  Write-Host "  + access_as_user scope" -ForegroundColor Green
+  Write-Host "  + SPA redirect URI"     -ForegroundColor Green
+
+  Invoke-WithGraphRetry -Description "Phase 3 pass 2" -Block {
+    Update-MgApplication -ApplicationId $app.Id `
+      -Api @{ Oauth2PermissionScopes = $allScopes; PreAuthorizedApplications = $allPreAuth } `
+      -ErrorAction Stop
+  } | Out-Null
+
+  Write-Host "  + Office client pre-auth" -ForegroundColor Green
+}
+
+# ===========================================================================
+# WARM UP THE WEB APP
+# ===========================================================================
+# After Phase 2's zipdeploy, the Node runtime in App Service takes 10-30s to
+# fully boot. The first request lands during boot and gets a generic "Error"
+# page from Azure. Poll /diagnostics until it returns 200 so the manifest URL
+# we print in the summary works on the first click.
+Write-Host ""
+Write-Host "  Waiting for Web App to finish warming up..." -ForegroundColor Gray
+$ready = $false
+for ($i = 1; $i -le 12; $i++) {
+  try {
+    $r = Invoke-WebRequest "https://$domain/diagnostics" -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+    if ($r.StatusCode -eq 200) { $ready = $true; break }
+  } catch { }
+  Start-Sleep -Seconds 5
+}
+if ($ready) {
+  Write-Host "  Web App is responding." -ForegroundColor Green
+} else {
+  Write-Host "  Web App didn't respond after 60s. URLs will still work shortly - if you see an error, wait a minute and refresh." -ForegroundColor Yellow
+}
+
+# ===========================================================================
+# FINAL SUMMARY
+# ===========================================================================
+Write-Banner "Deployment complete"
+
+$manifestUrl    = "https://$domain/manifest.xml"
+$diagnosticsUrl = "https://$domain/diagnostics"
+
+Write-Host ""
+Write-Host "  Web App URL    : https://$domain" -ForegroundColor White
+Write-Host "  App Client ID  : $appClientId" -ForegroundColor White
+Write-Host "  Tenant ID      : $tenantId" -ForegroundColor White
+Write-Host ""
+Write-Host "  Manifest URL (download for M365 Admin Center):" -ForegroundColor Cyan
+Write-Host "    $manifestUrl" -ForegroundColor White
+Write-Host ""
+Write-Host "  Diagnostics URL (verify deployment health):" -ForegroundColor Cyan
+Write-Host "    $diagnosticsUrl" -ForegroundColor White
+Write-Host ""
+
+if ($consentDeferredToAdmin) {
+  Write-Host "  !! ACTION REQUIRED - ADMIN CONSENT NOT YET GRANTED !!" -ForegroundColor Red
+  Write-Host "  Forward this URL to a user authorized to grant tenant-wide admin consent:" -ForegroundColor Yellow
+  Write-Host ""
+  Write-Host "    $deferredConsentUrl" -ForegroundColor Cyan
+  Write-Host ""
+  Write-Host "  The add-in will NOT work for end-users until they click Accept." -ForegroundColor Yellow
+  Write-Host ""
+}
+
+Write-Host "  Next steps (manual):" -ForegroundColor Yellow
+Write-Host "    1. Open the Manifest URL in a browser - saves manifest.xml" -ForegroundColor Yellow
+Write-Host "    2. Microsoft 365 Admin Center -> Integrated apps -> Deploy Add-in" -ForegroundColor Yellow
+Write-Host "       (or Update Add-in if a previous deployment exists)" -ForegroundColor Yellow
+Write-Host "       Upload manifest.xml" -ForegroundColor Yellow
+Write-Host "       This step requires a Global Administrator." -ForegroundColor Yellow
+Write-Host ""
+Write-Host "===========================================================================" -ForegroundColor Magenta
