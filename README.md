@@ -2,6 +2,10 @@
 
 This repository contains the necessary components and instructions to deploy the VMRay Report Phishing Add-in for Outlook. This tool allows users to report suspicious emails directly to a VMRay Incident Response (IR) mailbox for automated  analysis.
 
+> **This is the manual (portal-driven) deployment guide.** It deploys the add-in from `WebApp/` using the Azure portal, and you edit `manifest.xml` by hand before uploading it.
+>
+> There is also an automated, script-driven path that deploys from `WebAppAuto/` in a single PowerShell run and has the Web App serve its own manifest — see [README-auto.md](README-auto.md). Both versions are maintained in this repository; pick one and stay with it.
+
 ---
 
 ## Introduction
