@@ -1,5 +1,7 @@
 # VMRay Report Phishing Outlook Add-in Deployment Guide
 
+**Latest Version:** 1.1.0 - **Release Date: 01/09/2026**
+
 This repository contains the necessary components and instructions to deploy the VMRay Report Phishing Add-in for Outlook. This tool allows users to report suspicious emails directly to a VMRay Incident Response (IR) mailbox for automated  analysis.
 
 > **This is the manual (portal-driven) deployment guide.** It deploys the add-in from `WebApp/` using the Azure portal, and you edit `manifest.xml` by hand before uploading it.
@@ -7,6 +9,21 @@ This repository contains the necessary components and instructions to deploy the
 > There is also an automated, script-driven path that deploys from `WebAppAuto/` in a single PowerShell run and has the Web App serve its own manifest — see [README-auto.md](README-auto.md). Both versions are maintained in this repository; pick one and stay with it.
 
 ---
+
+## Table of Contents
+- [Introduction](#introduction)
+  - [Microsoft Outlook Add-ins](#microsoft-outlook-add-ins)
+  - [About VMRay](#about-vmray)
+- [Prerequisites](#prerequisites)
+- [Installation Steps](#installation-steps)
+  - [Phase 1 – Azure App Registration](#phase-1--azure-app-registration)
+  - [Phase 2 – Deploy Web App](#phase-2--deploy-web-app)
+  - [Phase 3 – Configure App Registration](#phase-3--configure-app-registration)
+  - [Phase 4 – Update manifest.xml](#phase-4--update-manifestxml)
+  - [Phase 5 – Deploy the Add-in via Microsoft 365 Admin Center](#phase-5--deploy-the-add-in-via-microsoft-365-admin-center)
+  - [Phase 6 – Verification](#phase-6--verification)
+- [Post-Deployment Validation Checklist](#post-deployment-validation-checklist)
+- [Version History](#version-history)
 
 ## Introduction
 
@@ -141,7 +158,7 @@ Note: You will not be able to view Client Secret after sometime. Save it securel
 9. Click `Apply` and `Confirm` 
 ---
 
-## Phase 3 – Configure App Registration 
+### Phase 3 – Configure App Registration
 
 1. Open App registration and Navigate to: **Manage → Authentication**
 2. Click: **+ Add Redirect URI → Single Page Application**
@@ -194,7 +211,7 @@ api://YOUR-DOMAIN/CLIENT_ID
 16. Click **Add application**
 ---
 
-# Phase 4 – Update manifest.xml
+### Phase 4 – Update manifest.xml
 
 * Open `manifest.xml` file and replace `{YOUR_DOMAIN}` with your Web App domain.
 
@@ -229,7 +246,7 @@ api://YOUR-DOMAIN/CLIENT_ID
 
 ---
 
-## Phase 5 – Deploy the Add-in via Microsoft 365 Admin Center
+### Phase 5 – Deploy the Add-in via Microsoft 365 Admin Center
 
 1. Go to the **Microsoft 365 Admin Center**
    [https://admin.microsoft.com](https://admin.microsoft.com)
@@ -304,7 +321,7 @@ If the add-in does not appear after deployment, try the following:
 
 ----
 
-## Phase 6 – Verification
+### Phase 6 – Verification
 After deployment, the add-in behavior depends on the deployment method selected in the Microsoft 365 Admin Center.
 
 #### If you selected:
@@ -338,3 +355,12 @@ After deployment, the add-in behavior depends on the deployment method selected 
 * Reporting a sample email forwards it to **RECIPIENT**
 * Task pane messages appear correctly
 * Web App `/health` endpoint returns `{"status":"OK"}`
+
+
+## Version History
+
+| Version        | Release Date | Release Notes
+|:---------------|:-------------|:---------------- |
+| 1.1.0          | `01-09-2026` | <ul><li>Added an automated, script-driven deployment path alongside the existing manual one. `WebAppAuto/Scripts/Deploy-VMRayOutlookAddin.ps1` deploys the App Registration and Web App in a single run, and the Web App serves its own `manifest.xml`, so there is no manifest to edit by hand. See [README-auto.md](README-auto.md) for the full guide.</li><li>Both deployment paths are maintained in the repository — `WebApp/` for the manual portal flow and `WebAppAuto/` for the automated flow.</li></ul> |
+| 1.0.1          | `22-05-2026` | <ul><li>Added the `MoveReportedPhishingEmailsToFolder` setting, which controls whether a reported phishing email is moved to a designated folder after it is reported.</li></ul> |
+| 1.0.0          | `05-03-2026` | <ul><li>Initial release</li><li>Outlook add-in that reports suspicious emails to a VMRay Incident Response mailbox for automated analysis</li><li>Azure Web App deployment template (`WebApp/azuredeploy.json`) with SSO through an Entra ID App Registration</li><li>`manifest.xml` for distribution through the Microsoft 365 Admin Center, and the full portal-driven deployment guide</li></ul> |
