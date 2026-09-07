@@ -1,5 +1,7 @@
 # VMRay Report Phishing Outlook Add-in — Automated Deployment Guide
 
+**Latest Version:** 1.1.0 - **Release Date: 01/09/2026** — see [Version History](README.md#version-history) in README.md.
+
 This repository contains the necessary components and instructions to deploy the VMRay Report Phishing Add-in for Outlook. This tool allows users to report suspicious emails directly to a VMRay Incident Response (IR) mailbox for automated analysis.
 
 > **This is the automated (script-driven) deployment guide.** It deploys the add-in from `WebAppAuto/` using a single PowerShell script, and the Web App serves its own manifest at `/manifest.xml`.
@@ -7,6 +9,27 @@ This repository contains the necessary components and instructions to deploy the
 > For the original manual, portal-driven deployment — which uses `WebApp/` and a manifest you edit by hand — see [README.md](README.md). Both versions are maintained in this repository; pick one and stay with it.
 
 ---
+
+## Table of Contents
+- [Introduction](#introduction)
+  - [Microsoft Outlook Add-ins](#microsoft-outlook-add-ins)
+  - [About VMRay](#about-vmray)
+- [Prerequisites](#prerequisites)
+- [Deployment Overview](#deployment-overview)
+- [Quick Start — Cloud Shell](#quick-start--cloud-shell)
+  - [Step 1 — Open Cloud Shell](#step-1--open-cloud-shell)
+  - [Step 2 — Upload the deployment script](#step-2--upload-the-deployment-script)
+  - [Step 3 — Run the deployment script](#step-3--run-the-deployment-script)
+  - [Step 4 — Note the manifest URL](#step-4--note-the-manifest-url)
+  - [Step 5 — Download the manifest](#step-5--download-the-manifest)
+  - [Step 6 — Upload the manifest in Microsoft 365 Admin Center](#step-6--upload-the-manifest-in-microsoft-365-admin-center)
+  - [Step 7 — Verify](#step-7--verify)
+- [Re-deployment / Reusing an Existing App Registration](#re-deployment--reusing-an-existing-app-registration)
+- [Verification](#verification)
+  - [Quick health check](#quick-health-check)
+  - [End-to-end test](#end-to-end-test)
+- [Troubleshooting](#troubleshooting)
+- [Summary — Comparison with the Original (Manual) Flow](#summary--comparison-with-the-original-manual-flow)
 
 ## Introduction
 

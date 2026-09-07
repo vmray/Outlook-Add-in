@@ -76,7 +76,7 @@
 
   "variables": {
     "planName": "[concat(parameters('WebAppName'), '-plan')]",
-    "packageUrl": "https://github.com/lshaikloginsoft/OutlookAddin-v2/raw/main/source.zip"
+    "packageUrl": "https://github.com/vmray/Outlook-Add-in/raw/main/WebApp/source.zip"
   },
 
   "resources": [
